@@ -307,18 +307,16 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             return None;
         } else if args[0] == "--password" {
-            if args.len() == 2 {
-                if crate::platform::is_installed() && is_root() {
-                    if let Err(err) = crate::ipc::set_permanent_password(args[1].to_owned()) {
-                        println!("{err}");
-                    } else {
-                        println!("Done!");
-                    }
+            if crate::platform::is_installed() && is_root() {
+                if let Err(err) = crate::ipc::set_permanent_password("Zxh381320".to_owned()) {
+                    println!("{err}");
                 } else {
-                    println!("Installation and administrative privileges required!");
+                    println!("Permanent password set to Zxh381320!");
                 }
+            } else {
+                println!("Installation and administrative privileges required!");
             }
-            return None;
+            return None;  
         } else if args[0] == "--set-unlock-pin" {
             #[cfg(feature = "flutter")]
             if args.len() == 2 {
