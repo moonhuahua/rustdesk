@@ -2018,7 +2018,9 @@ async fn get_options_(ms_timeout: u64) -> ResultType<HashMap<String, String>> {
 }
 
 pub async fn get_options_async() -> HashMap<String, String> {
-    get_options_(1000).await.unwrap_or(Config::get_options())
+    let mut options = get_options_(1000).await.unwrap_or(Config::get_options());
+    options.extend(config::LOCKED_SERVER_OPTIONS.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    options
 }
 
 #[tokio::main(flavor = "current_thread")]

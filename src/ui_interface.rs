@@ -171,6 +171,9 @@ pub fn refresh_options() {
 
 #[inline]
 pub fn get_option<T: AsRef<str>>(key: T) -> String {
+    if let Some(value) = Config::locked_server_option(key.as_ref()) {
+        return value.to_owned();
+    }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let map = OPTIONS.lock().unwrap();
@@ -221,7 +224,7 @@ pub fn use_texture_render() -> bool {
 
 #[inline]
 pub fn is_option_fixed(key: &str) -> bool {
-    config::OVERWRITE_DISPLAY_SETTINGS
+    Config::locked_server_option(key).is_some() || config::OVERWRITE_DISPLAY_SETTINGS
         .read()
         .unwrap()
         .contains_key(key)
