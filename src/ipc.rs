@@ -2037,6 +2037,9 @@ pub async fn get_option_async(key: &str) -> String {
 }
 
 pub fn set_option(key: &str, value: &str) {
+    if Config::locked_server_option(key).is_some() {
+        return;
+    }
     let mut options = get_options();
     if value.is_empty() {
         options.remove(key);
@@ -2047,7 +2050,8 @@ pub fn set_option(key: &str, value: &str) {
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
+pub async fn set_options(mut value: HashMap<String, String>) -> ResultType<()> {
+    value.extend(config::LOCKED_SERVER_OPTIONS.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let _nat = CheckTestNatType::new();
     let affected = crate::trusted_devices::config::changes_authentication(&value);
     let connection = connect(1000, "").await;
