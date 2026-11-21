@@ -70,6 +70,35 @@ void showServerSettingsWithValue(
     ServerConfig serverConfig,
     OverlayDialogManager dialogManager,
     void Function(VoidCallback)? upSetState) async {
+  if (isOptionFixed('custom-rendezvous-server')) {
+    dialogManager.show((setState, close, context) {
+      Widget maskedField(String label, String value) => Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: TextFormField(
+          initialValue: value,
+          enabled: false,
+          readOnly: true,
+          enableInteractiveSelection: false,
+          decoration: InputDecoration(labelText: translate(label)),
+        ),
+      );
+      return CustomAlertDialog(
+        title: Text(translate('ID/Relay Server')),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(minWidth: 420),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            maskedField('ID Server', '********'),
+            maskedField('Relay Server', '********'),
+            maskedField('API Server', ''),
+            maskedField('Key', '********'),
+            const Text('服务器配置已内置并锁定，无法修改。'),
+          ]),
+        ),
+        actions: [dialogButton('Close', onPressed: () => close())],
+      );
+    });
+    return;
+  }
   const labelWidth = 120.0;
   const labelSpacing = 8.0;
   var isInProgress = false;
