@@ -1,0 +1,166 @@
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -56,6 +56,17 @@
+ lazy_static::lazy_static! {
+     pub static ref ORG: RwLock<String> = RwLock::new("com.carriez".to_owned());
+ }
++
++// This distribution deliberately pins its server policy at compile time.
++pub const LOCKED_SERVER_OPTIONS: &[(&str, &str)] = &[
++    ("custom-rendezvous-server", "ddns.1728333.xyz:21116"),
++    ("relay-server", "ddns.1728333.xyz:21117"),
++    ("api-server", ""),
++    ("key", "+dGx3wX23ddYWNYdI9hEdpGGNcyms5VFdt22fszycFM="),
++    // A stock automatic update would replace this compiled policy.
++    ("enable-check-update", "N"),
++    ("allow-auto-update", "N"),
++];
+ 
+ type Size = (i32, i32, i32, i32);
+ type KeyPair = (Vec<u8>, Vec<u8>);
+@@ -1046,54 +1057,16 @@
+         }
+     }
+ 
++    pub fn locked_server_option(key: &str) -> Option<&'static str> {
++        LOCKED_SERVER_OPTIONS.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
++    }
++
+     pub fn get_rendezvous_server() -> String {
+-        let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = Self::get_option("custom-rendezvous-server");
+-        }
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        }
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();
+-        }
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = Self::get_rendezvous_servers()
+-                .drain(..)
+-                .next()
+-                .unwrap_or_default();
+-        }
+-        if !rendezvous_server.contains(':') {
+-            rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
+-        }
+-        rendezvous_server
++        Self::get_option("custom-rendezvous-server")
+     }
+ 
+     pub fn get_rendezvous_servers() -> Vec<String> {
+-        let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        if !s.is_empty() {
+-            return vec![s];
+-        }
+-        let s = Self::get_option("custom-rendezvous-server");
+-        if !s.is_empty() {
+-            return vec![s];
+-        }
+-        let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        if !s.is_empty() {
+-            return vec![s];
+-        }
+-        let serial_obsolute = CONFIG2.read().unwrap().serial > SERIAL;
+-        if serial_obsolute {
+-            let ss: Vec<String> = Self::get_option("rendezvous-servers")
+-                .split(',')
+-                .filter(|x| x.contains('.'))
+-                .map(|x| x.to_owned())
+-                .collect();
+-            if !ss.is_empty() {
+-                return ss;
+-            }
+-        }
+-        return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect();
++        vec![Self::get_rendezvous_server()]
+     }
+ 
+     pub fn reset_online() {
+@@ -1360,12 +1333,13 @@
+         let mut res = DEFAULT_SETTINGS.read().unwrap().clone();
+         res.extend(CONFIG2.read().unwrap().options.clone());
+         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
++        res.extend(LOCKED_SERVER_OPTIONS.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+         res
+     }
+ 
+     #[inline]
+     fn purify_options(v: &mut HashMap<String, String>) {
+-        v.retain(|k, v| is_option_can_save(&OVERWRITE_SETTINGS, k, &DEFAULT_SETTINGS, v));
++        v.retain(|k, v| Self::locked_server_option(k).is_none() && is_option_can_save(&OVERWRITE_SETTINGS, k, &DEFAULT_SETTINGS, v));
+     }
+ 
+     pub fn set_options(mut v: HashMap<String, String>) {
+@@ -1379,6 +1353,9 @@
+     }
+ 
+     pub fn get_option(k: &str) -> String {
++        if let Some(value) = Self::locked_server_option(k) {
++            return value.to_owned();
++        }
+         get_or(
+             &OVERWRITE_SETTINGS,
+             &CONFIG2.read().unwrap().options,
+@@ -1393,7 +1370,7 @@
+     }
+ 
+     pub fn set_option(k: String, v: String) {
+-        if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
++        if Self::locked_server_option(&k).is_some() || !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
+             let mut config = CONFIG2.write().unwrap();
+             if config.options.remove(&k).is_some() {
+                 config.store();
+@@ -2312,6 +2289,9 @@
+     }
+ 
+     pub fn get_option(k: &str) -> String {
++        if let Some(value) = Config::locked_server_option(k) {
++            return value.to_owned();
++        }
+         get_or(
+             &OVERWRITE_LOCAL_SETTINGS,
+             &LOCAL_CONFIG.read().unwrap().options,
+@@ -2337,7 +2317,7 @@
+     }
+ 
+     pub fn set_option(k: String, v: String) {
+-        if !is_option_can_save(&OVERWRITE_LOCAL_SETTINGS, &k, &DEFAULT_LOCAL_SETTINGS, &v) {
++        if Config::locked_server_option(&k).is_some() || !is_option_can_save(&OVERWRITE_LOCAL_SETTINGS, &k, &DEFAULT_LOCAL_SETTINGS, &v) {
+             let mut config = LOCAL_CONFIG.write().unwrap();
+             if config.options.remove(&k).is_some() {
+                 config.store();
+@@ -3777,3 +3757,31 @@
+         assert_ne!(non_service_root, non_service_user);
+     }
+ }
++
++#[cfg(test)]
++mod locked_server_policy_tests {
++    use super::*;
++
++    #[test]
++    fn locked_server_policy_rejects_overrides() {
++        for &(key, expected) in LOCKED_SERVER_OPTIONS {
++            Config::set_option(key.into(), "attacker.invalid:1".into());
++            assert_eq!(Config::get_option(key), expected);
++        }
++        let mut incoming = HashMap::new();
++        for &(key, _) in LOCKED_SERVER_OPTIONS {
++            incoming.insert(key.to_string(), "attacker.invalid:1".into());
++        }
++        Config::set_options(incoming);
++        *EXE_RENDEZVOUS_SERVER.write().unwrap() = "filename.invalid:1".into();
++        for &(key, expected) in LOCKED_SERVER_OPTIONS {
++            assert_eq!(Config::get_option(key), expected);
++            assert_eq!(Config::get_options().get(key).map(String::as_str), Some(expected));
++        }
++        assert_eq!(Config::get_rendezvous_server(), "ddns.1728333.xyz:21116");
++        assert_eq!(Config::get_rendezvous_servers(), vec!["ddns.1728333.xyz:21116"]);
++        LocalConfig::set_option("enable-check-update".into(), "Y".into());
++        assert_eq!(LocalConfig::get_option("enable-check-update"), "N");
++        assert_eq!(Config::locked_server_option("unrelated-setting"), None);
++    }
++}
