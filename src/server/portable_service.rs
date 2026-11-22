@@ -1344,8 +1344,8 @@ pub mod client {
             if self.fallback.is_none() {
                 self.try_enable_fallback(false);
             }
-            if let Some(cap) = self.fallback.as_mut() {
-                return cap.frame(timeout);
+            if self.fallback.is_some() {
+                return self.fallback.as_mut().unwrap().frame(timeout);
             }
             let read_res: std::io::Result<&'a [u8]> = {
                 let mut lock = SHMEM.lock().unwrap();
@@ -1430,9 +1430,7 @@ pub mod client {
                     if err.kind() != std::io::ErrorKind::WouldBlock
                         && self.try_enable_fallback(true)
                     {
-                        if let Some(cap) = self.fallback.as_mut() {
-                            return cap.frame(timeout);
-                        }
+                        return self.fallback.as_mut().unwrap().frame(timeout);
                     }
                     Err(err)
                 }
