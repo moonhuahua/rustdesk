@@ -28,7 +28,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use winapi::{
     shared::minwindef::{BOOL, FALSE, TRUE},
@@ -61,6 +61,7 @@ const SHMEM_PARENT_DIR: &str = "portable_service_shmem";
 const SHMEM_NAME_MAX_LEN: usize = 64;
 const MAX_NACK: usize = 3;
 const PORTABLE_SERVICE_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const PORTABLE_CAPTURE_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DXGI_FAIL_TIME: usize = 5;
 
 #[inline]
@@ -395,8 +396,8 @@ mod utils {
         unsafe {
             let wptr = counter;
             let rptr = counter.add(size_of::<i32>());
-            let iw = ptr_to_i32(counter);
-            let ir = ptr_to_i32(counter);
+            let iw = ptr_to_i32(wptr);
+            let ir = ptr_to_i32(rptr);
             let iw_plus1 = if iw == i32::MAX { 0 } else { iw + 1 };
             let v = i32_to_vec(iw_plus1);
             std::ptr::copy_nonoverlapping(v.as_ptr(), wptr, size_of::<i32>());
@@ -579,12 +580,15 @@ pub mod server {
     }
 
     fn run_capture(shmem: Arc<SharedMemory>) {
+        crate::platform::try_change_desktop();
         let mut c = None;
         let mut last_current_display = usize::MAX;
         let mut last_timeout_ms: i32 = 33;
         let mut spf = Duration::from_millis(last_timeout_ms as _);
         let mut first_frame_captured = false;
         let mut dxgi_failed_times = 0;
+        let mut gdi_failed_times = 0;
+        let mut try_gdi = 0;
         let mut display_width = 0;
         let mut display_height = 0;
         loop {
@@ -616,10 +620,19 @@ pub mod server {
                             c = {
                                 last_current_display = current_display;
                                 first_frame_captured = false;
+                                if !scrap::codec::enable_directx_capture() && !v.is_gdi() {
+                                    log::info!(
+                                        "Portable service disable dxgi with option, fall back to gdi"
+                                    );
+                                    v.set_gdi();
+                                }
                                 if dxgi_failed_times > MAX_DXGI_FAIL_TIME {
                                     dxgi_failed_times = 0;
                                     v.set_gdi();
+                                    log::info!("Portable service dxgi failed, fall back to gdi");
                                 }
+                                try_gdi = if v.is_gdi() { 0 } else { 1 };
+                                gdi_failed_times = 0;
                                 utils::set_para(
                                     &shmem,
                                     CapturerPara {
@@ -632,7 +645,9 @@ pub mod server {
                             }
                         }
                         Err(e) => {
-                            log::error!("Failed to create gdi capturer: {:?}", e);
+                            log::error!("Failed to create capturer: {:?}", e);
+                            crate::platform::try_change_desktop();
+                            shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(FALSE));
                             std::thread::sleep(std::time::Duration::from_secs(1));
                             continue;
                         }
@@ -688,6 +703,8 @@ pub mod server {
                             utils::increase_counter(shmem.as_ptr().add(ADDR_CAPTURE_FRAME_COUNTER));
                             first_frame_captured = true;
                             dxgi_failed_times = 0;
+                            gdi_failed_times = 0;
+                            try_gdi = 0;
                         }
                         Frame::Texture(_) => {
                             // should not happen
@@ -704,15 +721,41 @@ pub mod server {
                             // DXGI_ERROR_INVALID_CALL after each success on Microsoft GPU driver
                             // log::error!("capture frame failed: {:?}", e);
                             if c.as_ref().map(|c| c.is_gdi()) == Some(false) {
-                                // nog gdi
+                                // not gdi
                                 dxgi_failed_times += 1;
-                            }
-                            if dxgi_failed_times > MAX_DXGI_FAIL_TIME {
-                                c = None;
-                                shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(FALSE));
-                                std::thread::sleep(spf);
+                                if dxgi_failed_times > MAX_DXGI_FAIL_TIME {
+                                    c = None;
+                                    shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(FALSE));
+                                    std::thread::sleep(spf);
+                                }
+                            } else {
+                                gdi_failed_times += 1;
+                                if gdi_failed_times > MAX_DXGI_FAIL_TIME {
+                                    log::error!("Portable service gdi capture failed: {:?}", e);
+                                    crate::platform::try_change_desktop();
+                                    gdi_failed_times = 0;
+                                    c = None;
+                                    shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(FALSE));
+                                    std::thread::sleep(spf);
+                                }
                             }
                         } else {
+                            if !first_frame_captured && try_gdi > 0 {
+                                if let Some(cap) = c.as_mut() {
+                                    if !cap.is_gdi() {
+                                        if try_gdi > 3 {
+                                            if cap.set_gdi() {
+                                                log::info!(
+                                                    "Portable service no image, fall back to gdi"
+                                                );
+                                            }
+                                            try_gdi = 0;
+                                        } else {
+                                            try_gdi += 1;
+                                        }
+                                    }
+                                }
+                            }
                             shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
                         }
                     }
@@ -1186,8 +1229,13 @@ pub mod client {
     }
 
     pub struct CapturerPortable {
+        current_display: usize,
         width: usize,
         height: usize,
+        started_at: Instant,
+        got_frame: bool,
+        fallback: Option<Capturer>,
+        fallback_attempted: bool,
     }
 
     impl CapturerPortable {
@@ -1199,11 +1247,12 @@ pub mod client {
             if let Some(shmem) = option.as_mut() {
                 unsafe {
                     libc::memset(
-                        shmem.as_ptr().add(ADDR_CURSOR_PARA) as _,
+                        shmem.as_ptr().add(ADDR_CAPTURE_FRAME_INFO) as _,
                         0,
-                        shmem.len().saturating_sub(ADDR_CURSOR_PARA) as _,
+                        ADDR_CAPTURE_FRAME.saturating_sub(ADDR_CAPTURE_FRAME_INFO) as _,
                     );
                 }
+                shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
                 utils::set_para(
                     shmem,
                     CapturerPara {
@@ -1212,7 +1261,6 @@ pub mod client {
                         timeout_ms: 33,
                     },
                 );
-                shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
             }
             let (mut width, mut height) = (0, 0);
             if let Ok(displays) = display_service::try_get_displays() {
@@ -1221,101 +1269,198 @@ pub mod client {
                     height = display.height();
                 }
             }
-            CapturerPortable { width, height }
+            CapturerPortable {
+                current_display,
+                width,
+                height,
+                started_at: Instant::now(),
+                got_frame: false,
+                fallback: None,
+                fallback_attempted: false,
+            }
+        }
+
+        fn try_enable_fallback(&mut self, force: bool) -> bool {
+            if self.fallback.is_some() {
+                return true;
+            }
+            if self.fallback_attempted || self.got_frame {
+                return false;
+            }
+            if !force && self.started_at.elapsed() < PORTABLE_CAPTURE_FALLBACK_TIMEOUT {
+                return false;
+            }
+            if crate::platform::windows::is_process_consent_running().unwrap_or(false) {
+                return false;
+            }
+            self.fallback_attempted = true;
+            match scrap::Display::all() {
+                Ok(mut displays) if self.current_display < displays.len() => {
+                    let display = displays.remove(self.current_display);
+                    match Capturer::new(display) {
+                        Ok(mut cap) => {
+                            if !scrap::codec::enable_directx_capture() && !cap.is_gdi() {
+                                cap.set_gdi();
+                            }
+                            log::warn!(
+                                "Portable service produced no initial frame for display {} (force={}), falling back to direct capturer",
+                                self.current_display,
+                                force
+                            );
+                            self.fallback = Some(cap);
+                            true
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Failed to create direct fallback capturer for display {}: {:?}",
+                                self.current_display,
+                                e
+                            );
+                            false
+                        }
+                    }
+                }
+                Ok(displays) => {
+                    log::error!(
+                        "Invalid display index {} for direct fallback capturer (len={})",
+                        self.current_display,
+                        displays.len()
+                    );
+                    false
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to enumerate displays for direct fallback capturer: {:?}",
+                        e
+                    );
+                    false
+                }
+            }
         }
     }
 
     impl TraitCapturer for CapturerPortable {
         fn frame<'a>(&'a mut self, timeout: Duration) -> std::io::Result<Frame<'a>> {
-            let mut lock = SHMEM.lock().unwrap();
-            let shmem = lock.as_mut().ok_or(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "shmem dropped".to_string(),
-            ))?;
-            unsafe {
-                let base = shmem.as_ptr();
-                let para_ptr = base.add(ADDR_CAPTURER_PARA);
-                let para = para_ptr as *const CapturerPara;
-                if timeout.as_millis() != (*para).timeout_ms as _ {
-                    utils::set_para(
-                        shmem,
-                        CapturerPara {
-                            recreate: (*para).recreate,
-                            current_display: (*para).current_display,
-                            timeout_ms: timeout.as_millis() as _,
-                        },
-                    );
+            if self.fallback.is_none() {
+                self.try_enable_fallback(false);
+            }
+            if let Some(cap) = self.fallback.as_mut() {
+                return cap.frame(timeout);
+            }
+            let read_res: std::io::Result<&'a [u8]> = {
+                let mut lock = SHMEM.lock().unwrap();
+                let shmem = lock.as_mut().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "shmem dropped".to_string())
+                })?;
+                unsafe {
+                    let base = shmem.as_ptr();
+                    let para_ptr = base.add(ADDR_CAPTURER_PARA);
+                    let para = para_ptr as *const CapturerPara;
+                    if timeout.as_millis() != (*para).timeout_ms as _ {
+                        utils::set_para(
+                            shmem,
+                            CapturerPara {
+                                recreate: (*para).recreate,
+                                current_display: (*para).current_display,
+                                timeout_ms: timeout.as_millis() as _,
+                            },
+                        );
+                    }
+                    if utils::counter_ready(base.add(ADDR_CAPTURE_FRAME_COUNTER)) {
+                        let frame_info_ptr = shmem.as_ptr().add(ADDR_CAPTURE_FRAME_INFO);
+                        let frame_info = frame_info_ptr as *const FrameInfo;
+                        let frame_len = (*frame_info).length;
+                        if !is_valid_capture_frame_length(shmem.len(), frame_len) {
+                            log::error!(
+                                "Portable service frame length exceeds shared memory capacity: frame_len={}, shmem_len={}, frame_addr={}",
+                                frame_len,
+                                shmem.len(),
+                                ADDR_CAPTURE_FRAME
+                            );
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid portable service frame length".to_string(),
+                            ))
+                        } else if (*frame_info).width != self.width
+                            || (*frame_info).height != self.height
+                        {
+                            log::info!(
+                                "skip frame, ({},{}) != ({},{})",
+                                (*frame_info).width,
+                                (*frame_info).height,
+                                self.width,
+                                self.height,
+                            );
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "wouldblock error".to_string(),
+                            ))
+                        } else {
+                            let frame_ptr = base.add(ADDR_CAPTURE_FRAME);
+                            let data = slice::from_raw_parts(frame_ptr, frame_len);
+                            Ok(data)
+                        }
+                    } else {
+                        let ptr = base.add(ADDR_CAPTURE_WOULDBLOCK);
+                        let wouldblock = utils::ptr_to_i32(ptr);
+                        if wouldblock == TRUE {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "wouldblock error".to_string(),
+                            ))
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "other error".to_string(),
+                            ))
+                        }
+                    }
                 }
-                if utils::counter_ready(base.add(ADDR_CAPTURE_FRAME_COUNTER)) {
-                    let frame_info_ptr = shmem.as_ptr().add(ADDR_CAPTURE_FRAME_INFO);
-                    let frame_info = frame_info_ptr as *const FrameInfo;
-                    let frame_len = (*frame_info).length;
-                    if !is_valid_capture_frame_length(shmem.len(), frame_len) {
-                        log::error!(
-                            "Portable service frame length exceeds shared memory capacity: frame_len={}, shmem_len={}, frame_addr={}",
-                            frame_len,
-                            shmem.len(),
-                            ADDR_CAPTURE_FRAME
-                        );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "invalid portable service frame length".to_string(),
-                        ));
-                    }
-                    if (*frame_info).width != self.width || (*frame_info).height != self.height {
-                        log::info!(
-                            "skip frame, ({},{}) != ({},{})",
-                            (*frame_info).width,
-                            (*frame_info).height,
-                            self.width,
-                            self.height,
-                        );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "wouldblock error".to_string(),
-                        ));
-                    }
-                    let frame_ptr = base.add(ADDR_CAPTURE_FRAME);
-                    let data = slice::from_raw_parts(frame_ptr, frame_len);
+            };
+            match read_res {
+                Ok(data) => {
+                    self.got_frame = true;
                     Ok(Frame::PixelBuffer(PixelBuffer::with_BGRA(
                         data,
                         self.width,
                         self.height,
                     )))
-                } else {
-                    let ptr = base.add(ADDR_CAPTURE_WOULDBLOCK);
-                    let wouldblock = utils::ptr_to_i32(ptr);
-                    if wouldblock == TRUE {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "wouldblock error".to_string(),
-                        ))
-                    } else {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "other error".to_string(),
-                        ))
+                }
+                Err(err) => {
+                    if err.kind() != std::io::ErrorKind::WouldBlock
+                        && self.try_enable_fallback(true)
+                    {
+                        if let Some(cap) = self.fallback.as_mut() {
+                            return cap.frame(timeout);
+                        }
                     }
+                    Err(err)
                 }
             }
         }
 
         // control by itself
         fn is_gdi(&self) -> bool {
-            true
+            self.fallback.as_ref().map_or(true, |cap| cap.is_gdi())
         }
 
         fn set_gdi(&mut self) -> bool {
-            true
+            self.fallback.as_mut().map_or(true, |cap| cap.set_gdi())
         }
 
         #[cfg(feature = "vram")]
         fn device(&self) -> AdapterDevice {
-            AdapterDevice::default()
+            self.fallback
+                .as_ref()
+                .map_or_else(AdapterDevice::default, |cap| cap.device())
         }
 
         #[cfg(feature = "vram")]
-        fn set_output_texture(&mut self, _texture: bool) {}
+        fn set_output_texture(&mut self, texture: bool) {
+            if let Some(cap) = self.fallback.as_mut() {
+                cap.set_output_texture(texture);
+            }
+        }
     }
 
     pub(super) fn start_ipc_server() -> mpsc::UnboundedSender<Data> {
