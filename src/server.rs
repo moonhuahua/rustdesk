@@ -777,6 +777,19 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                     hbb_common::sleep(1.0).await;
                     std::thread::spawn(|| start_server(false, true));
                 } else {
+                    #[cfg(windows)]
+                    if std::env::args_os().len() == 1
+                        && std::env::var_os(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY)
+                            .is_some()
+                        && !crate::platform::is_self_service_running()
+                        && !hbb_common::config::is_outgoing_only()
+                        && Config::get_bool_option("stop-service")
+                    {
+                        // Resume the portable host here. The installed service path can relaunch
+                        // an older executable.
+                        Config::set_option("stop-service".into(), String::new());
+                        log::info!("Resuming hosting on portable launch");
+                    }
                     log::info!("try start server");
                     std::thread::spawn(|| start_server(true, false));
                 }
