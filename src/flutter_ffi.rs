@@ -2536,6 +2536,16 @@ pub fn main_start_ipc_url_server() {
     std::thread::spawn(move || crate::server::start_ipc_url_server());
 }
 
+pub fn main_start_portable_tray() -> bool {
+    #[cfg(windows)]
+    if std::env::args_os().len() == 1
+        && std::env::var_os(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY).is_some()
+    {
+        return crate::tray::start_portable_tray();
+    }
+    false
+}
+
 pub fn main_test_wallpaper(_second: u64) {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     std::thread::spawn(move || match crate::platform::WallPaperRemover::new() {

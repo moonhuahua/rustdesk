@@ -1690,6 +1690,8 @@ class RustdeskImpl {
     throw UnimplementedError("mainStartIpcUrlServer");
   }
 
+  Future<bool> mainStartPortableTray({dynamic hint}) async => false;
+
   Future<void> mainTestWallpaper({required int second, dynamic hint}) {
     // TODO: implement mainTestWallpaper
     return Future.value();

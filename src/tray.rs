@@ -20,10 +20,20 @@ pub fn start_tray() {
     #[cfg(target_os = "linux")]
     crate::server::check_zombie();
 
-    allow_err!(make_tray());
+    allow_err!(make_tray(None));
 }
 
-fn make_tray() -> hbb_common::ResultType<()> {
+#[cfg(windows)]
+pub fn start_portable_tray() -> bool {
+    if crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_TRAY) == "Y" {
+        return false;
+    }
+    let (ready, started) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || allow_err!(make_tray(Some(ready))));
+    started.recv_timeout(Duration::from_secs(5)).is_ok()
+}
+
+fn make_tray(mut portable_ready: Option<std::sync::mpsc::SyncSender<()>>) -> hbb_common::ResultType<()> {
     // https://github.com/tauri-apps/tray-icon/blob/dev/examples/tao.rs
     use hbb_common::anyhow::Context;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -34,8 +44,9 @@ fn make_tray() -> hbb_common::ResultType<()> {
 
     // Duplicated tray icons kept piling up through the blind spots of
     // `check_process("--tray", ..)`. https://github.com/rustdesk/rustdesk/issues/15689
+    let portable = portable_ready.is_some();
     #[cfg(windows)]
-    if !crate::platform::windows::try_lock_tray_single_instance() {
+    if !portable && !crate::platform::windows::try_lock_tray_single_instance() {
         log::info!("Another tray process is already running in this session, exit");
         return Ok(());
     }
@@ -61,7 +72,13 @@ fn make_tray() -> hbb_common::ResultType<()> {
     let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
         .context("Failed to open icon")?;
 
-    let mut event_loop = EventLoopBuilder::new().build();
+    let mut event_loop_builder = EventLoopBuilder::new();
+    #[cfg(windows)]
+    if portable {
+        use tao::platform::windows::EventLoopBuilderExtWindows;
+        event_loop_builder.with_any_thread(true).with_dpi_aware(false);
+    }
+    let mut event_loop = event_loop_builder.build();
 
     let tray_menu = Menu::new();
     let hide_stop_service = crate::ui_interface::get_builtin_option(
@@ -70,7 +87,8 @@ fn make_tray() -> hbb_common::ResultType<()> {
     // The tray icon is only shown when the service is running, so we don't need to check
     // the `stop-service` option here.
     let quit_i = if !hide_stop_service {
-        Some(MenuItem::new(translate("Stop service".to_owned()), true, None))
+        let label = if portable { "Exit" } else { "Stop service" };
+        Some(MenuItem::new(translate(label.to_owned()), true, None))
     } else {
         None
     };
@@ -153,8 +171,9 @@ fn make_tray() -> hbb_common::ResultType<()> {
             }
             // We create the icon once the event loop is actually running
             // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
+            let app_id = crate::get_app_name().to_lowercase();
             let mut builder = TrayIconBuilder::new()
-                .with_id(crate::get_app_name().to_lowercase())
+                .with_id(if portable { format!("{app_id}-portable") } else { app_id })
                 .with_menu(Box::new(tray_menu.clone()))
                 .with_tooltip(tooltip(0))
                 .with_icon(icon.clone());
@@ -169,8 +188,14 @@ fn make_tray() -> hbb_common::ResultType<()> {
                 builder = builder.with_menu_on_left_click(false);
             }
             let tray = builder.build();
+            let ready = portable_ready.take();
             match tray {
-                Ok(tray) => _tray_icon = Arc::new(Mutex::new(Some(tray))),
+                Ok(tray) => {
+                    _tray_icon = Arc::new(Mutex::new(Some(tray)));
+                    if let Some(ready) = ready {
+                        let _ = ready.send(());
+                    }
+                }
                 Err(err) => {
                     log::error!("Failed to create tray icon: {}", err);
                 }
@@ -205,6 +230,9 @@ fn make_tray() -> hbb_common::ResultType<()> {
                         .unwrap()
                         .as_mut()
                         .map(|t| t.set_visible(false));
+                    if portable {
+                        std::process::exit(0);
+                    }
                     if !crate::platform::uninstall_service(false, false) {
                         *control_flow = ControlFlow::Exit;
                     }

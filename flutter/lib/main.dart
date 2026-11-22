@@ -34,6 +34,7 @@ import 'models/platform_model.dart';
 int? kWindowId;
 WindowType? kWindowType;
 late List<String> kBootArgs;
+bool keepMainWindowInTray = false;
 
 Future<void> main(List<String> args) async {
   earlyAssert();
@@ -133,6 +134,9 @@ Future<void> initEnv(String appType) async {
 void runMainApp(bool startService) async {
   // register uni links
   await initEnv(kAppTypeMain);
+  if (isWindows) {
+    keepMainWindowInTray = await bind.mainStartPortableTray();
+  }
   checkUpdate();
   // trigger connection status updater
   await bind.mainCheckConnectStatus();
